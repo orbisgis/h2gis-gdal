@@ -10,7 +10,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # GDAL >= 3.5 provides a CMake configuration; older versions (Ubuntu 22.04 has
 # GDAL 3.4) are found by the FindGDAL module of CMake, which also defines GDAL::GDAL.
-find_package(GDAL CONFIG QUIET)
+# GDAL_LIBRARY and GDAL_INCLUDE_DIR given on the command line skip the CMake
+# configuration of GDAL, for an installation whose configuration is broken
+# (OSGeo4W references "/lib/gdalXYZ.lib").
+if(NOT GDAL_LIBRARY OR NOT GDAL_INCLUDE_DIR)
+    find_package(GDAL CONFIG QUIET)
+endif()
 if(NOT GDAL_FOUND)
     find_package(GDAL MODULE REQUIRED)
 endif()

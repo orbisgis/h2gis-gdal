@@ -180,8 +180,13 @@ jobs:
           # No generator named: CMake takes the newest Visual Studio of the
           # runner (the version changes with the windows-latest image)
           cmake --version
+          # The CMake configuration of the OSGeo4W GDAL references
+          # "/lib/gdalXYZ.lib", without the OSGeo4W root: give the library
+          # and the headers directly (FindGDAL module of CMake)
+          $lib = (Get-ChildItem C:\OSGeo4W\lib\gdal*.lib | Where-Object { $_.Name -match '^gdal\d*(_i)?\.lib$' } | Select-Object -First 1).FullName
+          Write-Output "GDAL library: $lib"
           cmake -S . -B build -A x64 `
-            -DCMAKE_PREFIX_PATH=C:/OSGeo4W -DGDAL_ROOT=C:/OSGeo4W
+            "-DGDAL_LIBRARY=$lib" -DGDAL_INCLUDE_DIR=C:/OSGeo4W/include
           cmake --build build --config Release
       - name: Check that GDAL loads the plugin
         shell: cmd

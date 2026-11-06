@@ -177,7 +177,10 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+          # No generator named: CMake takes the newest Visual Studio of the
+          # runner (the version changes with the windows-latest image)
+          cmake --version
+          cmake -S . -B build -A x64 `
             -DCMAKE_PREFIX_PATH=C:/OSGeo4W -DGDAL_ROOT=C:/OSGeo4W
           cmake --build build --config Release
       - name: Check that GDAL loads the plugin

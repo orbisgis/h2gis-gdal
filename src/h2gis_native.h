@@ -1,564 +1,493 @@
 /*
  * H2GIS driver for GDAL/OGR.
  *
- * Access to the H2GIS native library (GraalVM native image based on Mandrel, C API >= 3).
+ * Access to the H2GIS native library (GraalVM native image, C API >= 3).
+ *
+ * The library is loaded at run time, so the driver depends only on the GDAL
+ * ABI and h2gis.so can be updated on its own. One GraalVM isolate is created
+ * for the whole process: a second isolate would be a second H2 engine, and
+ * both would fight for the lock of the database files. Each thread that
+ * calls the library is attached to this isolate once, and detached when it
+ * ends.
  *
  * This code is part of the H2GIS project, LGPL 3.0.
  */
-#include "h2gis_native.h"
+#ifndef H2GIS_NATIVE_H
+#define H2GIS_NATIVE_H
 
-#include "cpl_conv.h"
-#include "cpl_error.h"
-#include "cpl_string.h"
-
-#include <cstring>
-#include <mutex>
-
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <dlfcn.h>
-#endif
+#include <cstdint>
+#include <string>
+#include <vector>
 
 /**
  * @namespace h2gis
- * @brief Internal helpers of the H2GIS GDAL/OGR driver.
+ * @brief Native bridge of the H2GIS GDAL/OGR driver.
  *
- * This namespace wraps the H2GIS native library (a GraalVM native image
- * exposing a C API). It handles:
- *  - dynamic loading of the shared library and symbol binding,
- *  - creation of the GraalVM isolate and per-thread attachment,
- *  - decoding of the binary result buffers returned by the native side.
- *
- * All public entry points are thread-safe: initialization runs once
- * (std::call_once) and each thread attaches itself to the isolate on
- * first use via a thread_local handle.
+ * Declares the C API function table (@ref Api), the process-wide entry
+ * points (@ref GetApi, @ref CurrentThread, @ref ReportLastError,
+ * @ref TakeString) and the @ref ResultBuffer decoder for binary result
+ * sets. The implementation lives in h2gis_native.cpp.
  */
 namespace h2gis
 {
 
-namespace
-{
+/**
+ * @brief Oldest version of the H2GIS C API the driver works with.
+ *
+ * Checked at initialization against the value returned by
+ * Api::version(); the driver refuses to run with an older library.
+ */
+constexpr int MIN_C_API_VERSION = 3;
 
-#if defined(_WIN32)
-constexpr const char *LIBRARY_NAME = "h2gis.dll";
-#elif defined(__APPLE__)
-constexpr const char *LIBRARY_NAME = "h2gis.dylib";
-#else
-constexpr const char *LIBRARY_NAME = "h2gis.so";
-#endif
+/** @brief Opaque handle of a thread attached to the GraalVM isolate. */
+using Thread = void;
 
-Api g_sApi;                  ///< Bound C API function pointers.
-Isolate *g_pIsolate = nullptr; ///< GraalVM isolate, created once.
-bool g_bReady = false;       ///< True once the library is loaded and the isolate created.
-std::once_flag g_oInitFlag;  ///< Guards one-time initialization.
+/** @brief Opaque handle of the GraalVM isolate (one per process). */
+using Isolate = void;
 
 /**
- * @brief Returns the directory containing the driver shared library.
+ * @brief Table of functions exported by the H2GIS native library.
  *
- * Used to locate the H2GIS native library next to the driver itself when
- * the H2GIS_LIBRARY configuration option is not set.
- *
- * @return Absolute path of the driver directory, or an empty string on failure.
+ * Every pointer is bound at load time by the driver (see C_API.md for the
+ * full contract of each function). All functions take the calling thread's
+ * @ref Thread handle as first argument, except the three GraalVM isolate
+ * management functions.
  */
-std::string DriverDirectory()
+struct Api
 {
-#ifdef _WIN32
-    HMODULE hModule = nullptr;
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCSTR>(&DriverDirectory), &hModule))
-    {
-        char szPath[MAX_PATH] = {};
-        if (GetModuleFileNameA(hModule, szPath, MAX_PATH) > 0)
-            return CPLGetPath(szPath);
-    }
-#else
-    Dl_info sInfo;
-    if (dladdr(reinterpret_cast<void *>(&DriverDirectory), &sInfo) &&
-        sInfo.dli_fname != nullptr)
-        return CPLGetPath(sInfo.dli_fname);
-#endif
-    return std::string();
-}
+    // -- GraalVM isolate management -----------------------------------------
 
-/**
- * @brief RAII handle for a thread attached to the GraalVM isolate.
- *
- * The thread that created the isolate is not owned (bOwned = false) and
- * is never detached. Any other thread that attaches itself is detached
- * automatically when the thread exits.
- */
-struct AttachedThread
-{
-    Thread *pThread = nullptr; ///< Native thread handle, null if not attached.
-    bool bOwned = false;       ///< false for the thread that created the isolate
+    /**
+     * @brief Creates the isolate and returns the handle of the calling thread.
+     * @param params  Isolate parameters (nullptr for defaults).
+     * @param isolate [out] Created isolate.
+     * @param thread  [out] Thread handle of the caller inside the isolate.
+     * @return 0 on success, non-zero on error.
+     */
+    int (*create_isolate)(void *params, Isolate **isolate, Thread **thread);
 
-    ~AttachedThread()
-    {
-        if (pThread != nullptr && bOwned && g_bReady)
-            g_sApi.detach_thread(pThread);
-    }
+    /**
+     * @brief Attaches the calling thread to an existing isolate.
+     * @param isolate Isolate to attach to.
+     * @param thread  [out] Thread handle valid for this thread.
+     * @return 0 on success, non-zero on error.
+     */
+    int (*attach_thread)(Isolate *isolate, Thread **thread);
+
+    /**
+     * @brief Detaches a thread from its isolate (called at thread exit).
+     * @param thread Thread handle to release.
+     * @return 0 on success, non-zero on error.
+     */
+    int (*detach_thread)(Thread *thread);
+
+    // -- Library information and memory --------------------------------------
+
+    /**
+     * @brief Returns the C API version implemented by the library.
+     * @param thread Thread handle.
+     * @return C API version number (must be >= MIN_C_API_VERSION).
+     */
+    int (*version)(Thread *);
+
+    /**
+     * @brief Returns the last error message of the calling thread.
+     * @param thread Thread handle.
+     * @return Newly allocated null-terminated string; must be released with
+     *         free_string() (see TakeString()).
+     */
+    char *(*get_last_error)(Thread *);
+
+    /**
+     * @brief Frees a string allocated by the library.
+     * @param thread Thread handle.
+     * @param ptr    String to free (as returned by get_last_error, etc.).
+     */
+    void (*free_string)(Thread *, void *);
+
+    /**
+     * @brief Frees a result buffer allocated by the library.
+     * @param thread Thread handle.
+     * @param ptr    Buffer to free (as returned by fetch_batch()).
+     */
+    void (*free_result_buffer)(Thread *, void *);
+
+    // -- Connections ----------------------------------------------------------
+
+    /**
+     * @brief Opens a connection to an H2/H2GIS database.
+     * @param thread   Thread handle.
+     * @param path     Database path or JDBC-style URL.
+     * @param user     User name.
+     * @param password Password.
+     * @return Connection handle (> 0), or a negative value on error.
+     */
+    long long (*connect)(Thread *, const char *path, const char *user, const char *password);
+
+    /**
+     * @brief Closes a connection.
+     * @param thread Thread handle.
+     * @param conn   Connection handle returned by connect().
+     */
+    void (*close_connection)(Thread *, long long conn);
+
+    // -- Queries --------------------------------------------------------------
+
+    /**
+     * @brief Executes a statement that does not return rows (DDL, INSERT, ...).
+     * @param thread Thread handle.
+     * @param conn   Connection handle.
+     * @param sql    SQL statement.
+     * @return Update count, or -1 on error (see get_last_error()).
+     */
+    int (*execute)(Thread *, long long conn, const char *sql);  // update count, -1 on error
+
+    /**
+     * @brief Executes a query and returns a result set handle.
+     * @param thread Thread handle.
+     * @param conn   Connection handle.
+     * @param sql    SQL query.
+     * @return Result set handle, or 0 on error.
+     */
+    long long (*fetch)(Thread *, long long conn, const char *sql);
+
+    /**
+     * @brief Fetches up to @p n rows of a result set into a binary buffer.
+     * @param thread    Thread handle.
+     * @param rs        Result set handle returned by fetch().
+     * @param n         Maximum number of rows to fetch.
+     * @param size_out  [out] Size in bytes of the returned buffer.
+     * @return Newly allocated buffer (column-oriented, little endian, see
+     *         ResultBuffer and C_API.md); must be freed with
+     *         free_result_buffer(). nullptr on error.
+     */
+    void *(*fetch_batch)(Thread *, long long rs, int n, long long *size_out);
+
+    /**
+     * @brief Returns the column metadata of a result set as a JSON string.
+     * @param thread Thread handle.
+     * @param rs     Result set handle.
+     * @return Newly allocated JSON string; free with free_string().
+     */
+    char *(*get_metadata_json)(Thread *, long long rs);
+
+    /**
+     * @brief Closes a result set or prepared statement.
+     * @param thread Thread handle.
+     * @param handle Result set / statement handle.
+     */
+    void (*close_query)(Thread *, long long handle);
+
+    /**
+     * @brief Lists tables of a connection as a JSON array.
+     * @param thread          Thread handle.
+     * @param conn            Connection handle.
+     * @param schema_pattern  SQL LIKE pattern for the schema (nullptr = all).
+     * @param table_pattern   SQL LIKE pattern for the table name (nullptr = all).
+     * @param spatial_only    If non-zero, only spatial (geometry) tables.
+     * @return Newly allocated JSON string; free with free_string().
+     */
+    char *(*get_tables_json)(Thread *, long long conn, const char *schema_pattern,
+                             const char *table_pattern, int spatial_only);
+
+    /**
+     * @brief Finds the SRID of a geometry column.
+     * @param thread Thread handle.
+     * @param conn   Connection handle.
+     * @param schema Schema name.
+     * @param table  Table name.
+     * @param column Geometry column name.
+     * @return SRID code, or a negative value if unknown / on error.
+     */
+    int (*find_srid)(Thread *, long long conn, const char *schema, const char *table,
+                     const char *column);
+
+    // -- Prepared statements --------------------------------------------------
+    // Parameters are 1-based; bind functions return 0 on success.
+
+    /**
+     * @brief Prepares a SQL statement.
+     * @param thread Thread handle.
+     * @param conn   Connection handle.
+     * @param sql    SQL statement with ? placeholders.
+     * @return Statement handle, or 0 on error.
+     */
+    long long (*prepare)(Thread *, long long conn, const char *sql);
+
+    /**
+     * @brief Binds an integer parameter.
+     * @param thread Thread handle.
+     * @param stmt   Statement handle.
+     * @param index  1-based parameter index.
+     * @param value  Value to bind.
+     * @return 0 on success, non-zero on error.
+     */
+    int (*bind_long)(Thread *, long long stmt, int index, long long value);
+
+    /**
+     * @brief Binds a floating-point parameter.
+     * @param thread Thread handle.
+     * @param stmt   Statement handle.
+     * @param index  1-based parameter index.
+     * @param value  Value to bind.
+     * @return 0 on success, non-zero on error.
+     */
+    int (*bind_double)(Thread *, long long stmt, int index, double value);
+
+    /**
+     * @brief Binds a string parameter.
+     * @param thread Thread handle.
+     * @param stmt   Statement handle.
+     * @param index  1-based parameter index.
+     * @param value  Null-terminated string to bind.
+     * @return 0 on success, non-zero on error.
+     */
+    int (*bind_string)(Thread *, long long stmt, int index, const char *value);
+
+    /**
+     * @brief Binds a binary (blob) parameter.
+     * @param thread Thread handle.
+     * @param stmt   Statement handle.
+     * @param index  1-based parameter index.
+     * @param value  Pointer to the bytes to bind.
+     * @param length Length in bytes.
+     * @return 0 on success, non-zero on error.
+     */
+    int (*bind_blob)(Thread *, long long stmt, int index, const void *value, int length);
+
+    /**
+     * @brief Binds SQL NULL to a parameter.
+     * @param thread Thread handle.
+     * @param stmt   Statement handle.
+     * @param index  1-based parameter index.
+     * @return 0 on success, non-zero on error.
+     */
+    int (*bind_null)(Thread *, long long stmt, int index);
+
+    /**
+     * @brief Executes a prepared statement that returns a result set.
+     * @param thread Thread handle.
+     * @param stmt   Statement handle.
+     * @return Result set handle, or 0 on error.
+     */
+    long long (*execute_prepared)(Thread *, long long stmt);  // result set handle, 0 on error
+
+    /**
+     * @brief Executes a prepared statement that does not return rows.
+     * @param thread Thread handle.
+     * @param stmt   Statement handle.
+     * @return Update count, or -1 on error.
+     */
+    int (*execute_prepared_update)(Thread *, long long stmt);  // update count, -1 on error
 };
 
-thread_local AttachedThread tl_oThread; ///< Per-thread isolate attachment.
-
 /**
- * @brief Binds one symbol from the native library into a function pointer.
+ * @brief Loads the library and creates the isolate, once for the process.
  *
- * @tparam T Function pointer type.
- * @param pszLibrary Path of the library (for error messages).
- * @param pszName Name of the exported symbol.
- * @param pfn [out] Function pointer to fill.
- * @return true on success; on failure, raises a CPLError and returns false.
+ * The library is searched in this order:
+ *  1. the H2GIS_LIBRARY GDAL configuration option;
+ *  2. next to the driver shared library;
+ *  3. in the default system library path.
+ *
+ * Thread-safe (std::call_once internally).
+ *
+ * @return Pointer to the bound function table, or nullptr after a CPLError
+ *         if the library cannot be loaded or its C API version is older
+ *         than MIN_C_API_VERSION.
  */
-template <typename T> bool Bind(const char *pszLibrary, const char *pszName, T &pfn)
-{
-    pfn = reinterpret_cast<T>(CPLGetSymbol(pszLibrary, pszName));
-    if (pfn == nullptr)
-    {
-        CPLError(CE_Failure, CPLE_AppDefined,
-                 "H2GIS: %s has no function %s; this driver needs the H2GIS "
-                 "C API version %d or later",
-                 pszLibrary, pszName, MIN_C_API_VERSION);
-        return false;
-    }
-    return true;
-}
+const Api *GetApi();
 
 /**
- * @brief Binds all required C API symbols from the loaded library.
+ * @brief Returns the isolate thread handle of the calling thread.
  *
- * @param osLibrary Path of the native library.
- * @return true if every symbol was found, false otherwise (a CPLError is raised).
+ * The thread is attached to the process-wide isolate on first use and
+ * detached automatically when the thread ends.
+ *
+ * @return Thread handle, or nullptr if the driver is not initialized or
+ *         the attachment failed.
  */
-bool Load(const std::string &osLibrary)
-{
-    const char *pszLib = osLibrary.c_str();
-    return Bind(pszLib, "graal_create_isolate", g_sApi.create_isolate) &&
-           Bind(pszLib, "graal_attach_thread", g_sApi.attach_thread) &&
-           Bind(pszLib, "graal_detach_thread", g_sApi.detach_thread) &&
-           Bind(pszLib, "h2gis_version", g_sApi.version) &&
-           Bind(pszLib, "h2gis_get_last_error", g_sApi.get_last_error) &&
-           Bind(pszLib, "h2gis_free_string", g_sApi.free_string) &&
-           Bind(pszLib, "h2gis_free_result_buffer", g_sApi.free_result_buffer) &&
-           Bind(pszLib, "h2gis_connect", g_sApi.connect) &&
-           Bind(pszLib, "h2gis_close_connection", g_sApi.close_connection) &&
-           Bind(pszLib, "h2gis_execute", g_sApi.execute) &&
-           Bind(pszLib, "h2gis_fetch", g_sApi.fetch) &&
-           Bind(pszLib, "h2gis_fetch_batch", g_sApi.fetch_batch) &&
-           Bind(pszLib, "h2gis_get_metadata_json", g_sApi.get_metadata_json) &&
-           Bind(pszLib, "h2gis_close_query", g_sApi.close_query) &&
-           Bind(pszLib, "h2gis_get_tables_json", g_sApi.get_tables_json) &&
-           Bind(pszLib, "h2gis_find_srid", g_sApi.find_srid) &&
-           Bind(pszLib, "h2gis_prepare", g_sApi.prepare) &&
-           Bind(pszLib, "h2gis_bind_long", g_sApi.bind_long) &&
-           Bind(pszLib, "h2gis_bind_double", g_sApi.bind_double) &&
-           Bind(pszLib, "h2gis_bind_string", g_sApi.bind_string) &&
-           Bind(pszLib, "h2gis_bind_blob", g_sApi.bind_blob) &&
-           Bind(pszLib, "h2gis_bind_null", g_sApi.bind_null) &&
-           Bind(pszLib, "h2gis_execute_prepared", g_sApi.execute_prepared) &&
-           Bind(pszLib, "h2gis_execute_prepared_update", g_sApi.execute_prepared_update);
-}
+Thread *CurrentThread();
 
 /**
- * @brief One-time initialization: locate, load, bind and check the native library.
- *
- * Search order for the library:
- *  1. the H2GIS_LIBRARY GDAL configuration option, if set;
- *  2. the library placed next to the driver shared object;
- *  3. the bare library name (relying on the system loader search path).
- *
- * After loading, a GraalVM isolate is created and the C API version is
- * checked against MIN_C_API_VERSION. On success g_bReady is set to true.
+ * @brief Raises a CPLError with the last native error of the calling thread.
+ * @param pszWhat Short description of the failed operation (prefix).
  */
-void Initialize()
-{
-    // Candidate libraries, in order
-    CPLStringList aosCandidates;
-    const char *pszOption = CPLGetConfigOption("H2GIS_LIBRARY", nullptr);
-    if (pszOption != nullptr)
-    {
-        aosCandidates.AddString(pszOption);
-    }
-    else
-    {
-        const std::string osDir = DriverDirectory();
-        if (!osDir.empty())
-            aosCandidates.AddString(CPLFormFilename(osDir.c_str(), LIBRARY_NAME, nullptr));
-        aosCandidates.AddString(LIBRARY_NAME);
-    }
-
-    std::string osLibrary;
-    for (int i = 0; i < aosCandidates.size() && osLibrary.empty(); i++)
-    {
-        CPLPushErrorHandler(CPLQuietErrorHandler);
-        void *pSymbol = CPLGetSymbol(aosCandidates[i], "h2gis_version");
-        CPLPopErrorHandler();
-        if (pSymbol != nullptr)
-            osLibrary = aosCandidates[i];
-    }
-    CPLErrorReset();
-    if (osLibrary.empty())
-    {
-        CPLError(CE_Failure, CPLE_AppDefined,
-                 "H2GIS: cannot load the native library %s. Set the "
-                 "H2GIS_LIBRARY configuration option to its path.",
-                 pszOption != nullptr ? pszOption : LIBRARY_NAME);
-        return;
-    }
-    if (!Load(osLibrary))
-        return;
-
-    Thread *pThread = nullptr;
-    if (g_sApi.create_isolate(nullptr, &g_pIsolate, &pThread) != 0)
-    {
-        CPLError(CE_Failure, CPLE_AppDefined, "H2GIS: cannot create the GraalVM isolate");
-        return;
-    }
-    const int nVersion = g_sApi.version(pThread);
-    if (nVersion < MIN_C_API_VERSION)
-    {
-        CPLError(CE_Failure, CPLE_AppDefined,
-                 "H2GIS: %s implements the C API version %d; this driver "
-                 "needs version %d or later",
-                 osLibrary.c_str(), nVersion, MIN_C_API_VERSION);
-        return;
-    }
-    tl_oThread.pThread = pThread;
-    tl_oThread.bOwned = false;
-    g_bReady = true;
-    CPLDebug("H2GIS", "Native library %s, C API version %d", osLibrary.c_str(), nVersion);
-}
-
-}  // namespace
+void ReportLastError(const char *pszWhat);
 
 /**
- * @brief Returns the bound C API, initializing the native library on first call.
+ * @brief Copies a library-allocated string into a std::string and frees it.
  *
- * Thread-safe: initialization is performed exactly once via std::call_once.
+ * Convenience wrapper around Api::free_string().
  *
- * @return Pointer to the Api structure, or nullptr if the native library
- *         could not be loaded or has an incompatible C API version.
- */
-const Api *GetApi()
-{
-    std::call_once(g_oInitFlag, Initialize);
-    return g_bReady ? &g_sApi : nullptr;
-}
-
-/**
- * @brief Returns the native thread handle for the calling thread.
- *
- * The calling thread is attached to the GraalVM isolate on first use;
- * the attachment is kept in a thread_local and detached automatically
- * at thread exit.
- *
- * @return The Thread handle, or nullptr if the driver is not ready or the
- *         attachment failed (a CPLError is raised in that case).
- */
-Thread *CurrentThread()
-{
-    if (!g_bReady)
-        return nullptr;
-    if (tl_oThread.pThread == nullptr)
-    {
-        Thread *pThread = nullptr;
-        if (g_sApi.attach_thread(g_pIsolate, &pThread) != 0)
-        {
-            CPLError(CE_Failure, CPLE_AppDefined, "H2GIS: cannot attach the thread to the isolate");
-            return nullptr;
-        }
-        tl_oThread.pThread = pThread;
-        tl_oThread.bOwned = true;
-    }
-    return tl_oThread.pThread;
-}
-
-/**
- * @brief Takes ownership of a string returned by the native library.
- *
- * The string is copied into a std::string and then freed through the
- * native h2gis_free_string function.
- *
- * @param pszValue Null-terminated string allocated by the native library
+ * @param pszValue Null-terminated string allocated by the library
  *        (may be nullptr).
  * @return The string content (empty if pszValue was nullptr).
  */
-std::string TakeString(char *pszValue)
-{
-    if (pszValue == nullptr)
-        return std::string();
-    std::string osValue(pszValue);
-    g_sApi.free_string(CurrentThread(), pszValue);
-    return osValue;
-}
-
-/**
- * @brief Raises a CPLError containing the last native error message.
- *
- * @param pszWhat Short description of the failed operation, used as prefix.
- */
-void ReportLastError(const char *pszWhat)
-{
-    Thread *pThread = CurrentThread();
-    std::string osMessage = pThread ? TakeString(g_sApi.get_last_error(pThread)) : std::string();
-    CPLError(CE_Failure, CPLE_AppDefined, "H2GIS: %s: %s", pszWhat,
-             osMessage.empty() ? "unknown error" : osMessage.c_str());
-}
-
-// ---------------------------------------------------------------------------
-// ResultBuffer
-// ---------------------------------------------------------------------------
-
-namespace
-{
-/**
- * @brief Reads a little-endian uint32 from a byte buffer.
- * @param p Pointer to at least 4 readable bytes.
- * @return The decoded 32-bit unsigned value.
- */
-uint32_t ReadU32(const uint8_t *p)
-{
-    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
-}
-
-/**
- * @brief Reads a little-endian uint64 from a byte buffer.
- * @param p Pointer to at least 8 readable bytes.
- * @return The decoded 64-bit unsigned value.
- */
-uint64_t ReadU64(const uint8_t *p)
-{
-    return static_cast<uint64_t>(ReadU32(p)) | (static_cast<uint64_t>(ReadU32(p + 4)) << 32);
-}
-
-constexpr uint32_t NULL_MASK_FLAG = 0x100; ///< Type-code flag indicating a null bitmap follows.
-}
+std::string TakeString(char *pszValue);
 
 /**
  * @class ResultBuffer
- * @brief Decoded view over a binary result buffer returned by the native library.
+ * @brief Decoded view over a binary result buffer returned by Api::fetch_batch.
  *
- * Wire format (all integers little-endian):
- * @verbatim
- *   u32  column count (N)
- *   u32  row count (R)
- *   u64  offset[ N ]   offset of each column descriptor from buffer start
+ * The buffer format is specified in C_API.md: column-oriented, little
+ * endian, with a header (column count, row count, column offsets), then
+ * one descriptor per column (name, type code, optional null bitmap,
+ * packed values). The buffer is owned by the object and freed with
+ * Api::free_result_buffer() on destruction or on the next Reset() call.
  *
- *   Column descriptor (at its offset):
- *     u32  name length, then name bytes (not null-terminated)
- *     u32  type code (bit 0x100 set => a null bitmap follows)
- *     [ (R+7)/8 bytes null bitmap, present only if flag 0x100 is set ]
- *     u32  values length (V), then V bytes of packed values
- * @endverbatim
- *
- * Values are packed per type: 4 bytes for INT/FLOAT, 8 for LONG/DOUBLE,
- * 1 byte per row for BOOLEAN, and for other (variable-length) types a
- * sequence of (u32 length, bytes) entries, one per row.
+ * @note Non-copyable: the underlying native buffer has unique ownership.
  */
-ResultBuffer::~ResultBuffer()
+class ResultBuffer
 {
-    Free();
-}
-
-/**
- * @brief Releases the native buffer and resets the object to an empty state.
- */
-void ResultBuffer::Free()
-{
-    if (m_pabyBuffer != nullptr)
-        g_sApi.free_result_buffer(CurrentThread(), m_pabyBuffer);
-    m_pabyBuffer = nullptr;
-    m_nRows = 0;
-    m_aoColumns.clear();
-}
-
-/**
- * @brief Parses and validates a native result buffer.
- *
- * Any previously held buffer is freed first. The buffer is fully
- * validated (bounds-checked) before being accepted.
- *
- * @param pBuffer Pointer to the native buffer (ownership transferred).
- * @param nSize   Size of the buffer in bytes.
- * @return true if the buffer was parsed successfully, false if it is
- *         null, too small, or malformed.
- */
-bool ResultBuffer::Reset(void *pBuffer, long long nSize)
-{
-    Free();
-    m_pabyBuffer = static_cast<uint8_t *>(pBuffer);
-    if (m_pabyBuffer == nullptr || nSize < 8)
-        return false;
-    const uint8_t *p = m_pabyBuffer;
-    const uint8_t *pEnd = m_pabyBuffer + nSize;
-    const uint32_t nColumns = ReadU32(p);
-    m_nRows = static_cast<int>(ReadU32(p + 4));
-    if (8 + 8 * static_cast<uint64_t>(nColumns) > static_cast<uint64_t>(nSize))
-        return false;
-
-    m_aoColumns.resize(nColumns);
-    for (uint32_t i = 0; i < nColumns; i++)
+  public:
+    /**
+     * @brief Column type codes used in the wire format.
+     *
+     * The value is the low bits of the type code read from the buffer;
+     * bit 0x100 of the raw code flags the presence of a null bitmap.
+     */
+    enum Type
     {
-        const uint64_t nOffset = ReadU64(p + 8 + 8 * i);
-        if (nOffset + 4 > static_cast<uint64_t>(nSize))
-            return false;
-        const uint8_t *q = m_pabyBuffer + nOffset;
-        Column &oCol = m_aoColumns[i];
+        INT = 1,       ///< 32-bit signed integer (4 bytes/row)
+        LONG = 2,      ///< 64-bit signed integer (8 bytes/row)
+        FLOAT = 3,     ///< 32-bit IEEE float (4 bytes/row)
+        DOUBLE = 4,    ///< 64-bit IEEE double (8 bytes/row)
+        BOOLEAN = 5,   ///< Boolean (1 byte/row)
+        STRING = 6,    ///< Variable-length UTF-8 string
+        TEMPORAL = 7,  ///< Date/time value (variable length)
+        GEOMETRY = 8,  ///< Geometry (variable length)
+        BINARY = 9,    ///< Binary blob (variable length)
+        DECIMAL = 10,  ///< Decimal number (variable length)
+        JSON = 11,     ///< JSON text (variable length)
+        UUID = 12,     ///< UUID (variable length)
+        OTHER = 99     ///< Any other type (variable length)
+    };
 
-        const uint32_t nNameLength = ReadU32(q);
-        q += 4;
-        if (q + nNameLength + 4 > pEnd)
-            return false;
-        oCol.osName.assign(reinterpret_cast<const char *>(q), nNameLength);
-        q += nNameLength;
+    ResultBuffer() = default;
+    ~ResultBuffer();
 
-        const uint32_t nTypeCode = ReadU32(q);
-        q += 4;
-        oCol.nType = static_cast<int>(nTypeCode & ~NULL_MASK_FLAG);
-        if (nTypeCode & NULL_MASK_FLAG)
-        {
-            oCol.pabyNullMask = q;
-            q += (m_nRows + 7) / 8;
-        }
-        if (q + 4 > pEnd)
-            return false;
-        oCol.nValuesLength = ReadU32(q);
-        q += 4;
-        if (q + oCol.nValuesLength > pEnd)
-            return false;
-        oCol.pabyValues = q;
+    /** @brief Non-copyable (owns a native buffer). */
+    ResultBuffer(const ResultBuffer &) = delete;
+    /** @brief Non-copyable (owns a native buffer). */
+    ResultBuffer &operator=(const ResultBuffer &) = delete;
 
-        switch (oCol.nType)
-        {
-            case INT:
-            case FLOAT:
-                if (oCol.nValuesLength < 4u * m_nRows)
-                    return false;
-                break;
-            case LONG:
-            case DOUBLE:
-                if (oCol.nValuesLength < 8u * m_nRows)
-                    return false;
-                break;
-            case BOOLEAN:
-                if (oCol.nValuesLength < static_cast<uint32_t>(m_nRows))
-                    return false;
-                break;
-            default:
-            {
-                // u32 length + bytes, one after the other
-                oCol.anOffsets.resize(m_nRows);
-                uint32_t nPos = 0;
-                for (int iRow = 0; iRow < m_nRows; iRow++)
-                {
-                    if (nPos + 4 > oCol.nValuesLength)
-                        return false;
-                    oCol.anOffsets[iRow] = nPos;
-                    nPos += 4 + ReadU32(oCol.pabyValues + nPos);
-                    if (nPos > oCol.nValuesLength)
-                        return false;
-                }
-                break;
-            }
-        }
-    }
-    return true;
-}
+    /**
+     * @brief Takes ownership of a native buffer and parses it.
+     *
+     * Any previously held buffer is freed first. The buffer is fully
+     * bounds-checked before being accepted.
+     *
+     * @param pBuffer Pointer returned by Api::fetch_batch (ownership transferred).
+     * @param nSize   Size in bytes of the buffer.
+     * @return false if the buffer is null or malformed (object left empty).
+     */
+    bool Reset(void *pBuffer, long long nSize);
 
-/**
- * @brief Tests whether a cell is NULL.
- *
- * @param iCol Zero-based column index.
- * @param iRow Zero-based row index.
- * @return true if the column has a null bitmap and the bit for the row is set.
- */
-bool ResultBuffer::IsNull(int iCol, int iRow) const
-{
-    const uint8_t *pabyMask = m_aoColumns[iCol].pabyNullMask;
-    return pabyMask != nullptr && (pabyMask[iRow / 8] & (1 << (iRow % 8))) != 0;
-}
-
-/**
- * @brief Reads a cell as an integer.
- *
- * Supports INT, LONG and BOOLEAN columns (BOOLEAN yields 0 or 1).
- *
- * @param iCol Zero-based column index.
- * @param iRow Zero-based row index.
- * @return The cell value, or 0 for unsupported column types.
- */
-int64_t ResultBuffer::GetInteger(int iCol, int iRow) const
-{
-    const Column &oCol = m_aoColumns[iCol];
-    switch (oCol.nType)
+    /**
+     * @brief Number of columns in the result.
+     * @return Column count (0 if Reset() was never called or failed).
+     */
+    int GetColumnCount() const
     {
-        case INT:
-            return static_cast<int32_t>(ReadU32(oCol.pabyValues + 4 * iRow));
-        case LONG:
-            return static_cast<int64_t>(ReadU64(oCol.pabyValues + 8 * iRow));
-        case BOOLEAN:
-            return oCol.pabyValues[iRow] != 0;
-        default:
-            return 0;
+        return static_cast<int>(m_aoColumns.size());
     }
-}
 
-/**
- * @brief Reads a cell as a double.
- *
- * Supports FLOAT and DOUBLE columns directly; other numeric types are
- * converted through GetInteger().
- *
- * @param iCol Zero-based column index.
- * @param iRow Zero-based row index.
- * @return The cell value as a double.
- */
-double ResultBuffer::GetDouble(int iCol, int iRow) const
-{
-    const Column &oCol = m_aoColumns[iCol];
-    switch (oCol.nType)
+    /**
+     * @brief Number of rows fetched in this batch.
+     * @return Row count (0 if Reset() was never called or failed).
+     */
+    int GetRowCount() const
     {
-        case FLOAT:
-        {
-            const uint32_t nBits = ReadU32(oCol.pabyValues + 4 * iRow);
-            float fValue;
-            memcpy(&fValue, &nBits, sizeof(fValue));
-            return fValue;
-        }
-        case DOUBLE:
-        {
-            const uint64_t nBits = ReadU64(oCol.pabyValues + 8 * iRow);
-            double dfValue;
-            memcpy(&dfValue, &nBits, sizeof(dfValue));
-            return dfValue;
-        }
-        default:
-            return static_cast<double>(GetInteger(iCol, iRow));
+        return m_nRows;
     }
-}
 
-/**
- * @brief Reads a variable-length cell (string/blob) as raw bytes.
- *
- * @param iCol Zero-based column index.
- * @param iRow Zero-based row index.
- * @param nLength [out] Length in bytes of the returned data.
- * @return Pointer to the cell bytes inside the buffer (not null-terminated),
- *         or nullptr with nLength = 0 for fixed-width columns.
- */
-const uint8_t *ResultBuffer::GetBytes(int iCol, int iRow, uint32_t &nLength) const
-{
-    const Column &oCol = m_aoColumns[iCol];
-    if (oCol.anOffsets.empty())
+    /**
+     * @brief Name of a column.
+     * @param iCol Zero-based column index.
+     * @return Column name (as declared in the query).
+     */
+    const std::string &GetName(int iCol) const
     {
-        nLength = 0;
-        return nullptr;
+        return m_aoColumns[iCol].osName;
     }
-    const uint8_t *p = oCol.pabyValues + oCol.anOffsets[iRow];
-    nLength = ReadU32(p);
-    return p + 4;
-}
+
+    /**
+     * @brief Type code of a column (one of the Type enum values).
+     * @param iCol Zero-based column index.
+     * @return Type code.
+     */
+    int GetType(int iCol) const
+    {
+        return m_aoColumns[iCol].nType;
+    }
+
+    /**
+     * @brief Tests whether a cell is NULL.
+     * @param iCol Zero-based column index.
+     * @param iRow Zero-based row index.
+     * @return true if the cell is NULL (columns without a null bitmap are never NULL).
+     */
+    bool IsNull(int iCol, int iRow) const;
+
+    /**
+     * @brief Reads a cell as an integer.
+     *
+     * Valid for INT, LONG and BOOLEAN columns (BOOLEAN yields 0 or 1).
+     *
+     * @param iCol Zero-based column index.
+     * @param iRow Zero-based row index.
+     * @return Cell value, or 0 for unsupported types.
+     */
+    int64_t GetInteger(int iCol, int iRow) const;  // INT, LONG, BOOLEAN
+
+    /**
+     * @brief Reads a cell as a double.
+     *
+     * Valid for FLOAT and DOUBLE columns; INT, LONG and BOOLEAN are
+     * converted through GetInteger().
+     *
+     * @param iCol Zero-based column index.
+     * @param iRow Zero-based row index.
+     * @return Cell value as double.
+     */
+    double GetDouble(int iCol, int iRow) const;    // FLOAT, DOUBLE, INT, LONG
+
+    /**
+     * @brief Reads a variable-length cell (STRING, GEOMETRY, BINARY, ...).
+     *
+     * @param iCol    Zero-based column index.
+     * @param iRow    Zero-based row index.
+     * @param nLength [out] Length in bytes of the returned data.
+     * @return Pointer to the bytes inside the buffer (not null-terminated,
+     *         valid until the next Reset()/destruction), or nullptr with
+     *         nLength = 0 for fixed-width columns.
+     */
+    const uint8_t *GetBytes(int iCol, int iRow, uint32_t &nLength) const;
+
+  private:
+    /**
+     * @brief Parsed metadata and raw pointers of one column.
+     *
+     * All pointers reference the owned native buffer m_pabyBuffer.
+     */
+    struct Column
+    {
+        std::string osName;                        ///< Column name.
+        int nType = 0;                             ///< Type code (Type enum).
+        const uint8_t *pabyNullMask = nullptr;     ///< Null bitmap ((rows+7)/8 bytes), or nullptr.
+        const uint8_t *pabyValues = nullptr;       ///< Packed values.
+        uint32_t nValuesLength = 0;                ///< Size in bytes of the values block.
+        std::vector<uint32_t> anOffsets;           ///< Per-row offsets into pabyValues (variable-length types only).
+    };
+
+    /** @brief Frees the native buffer and clears the parsed columns. */
+    void Free();
+
+    uint8_t *m_pabyBuffer = nullptr;   ///< Owned native buffer.
+    int m_nRows = 0;                   ///< Row count of the current batch.
+    std::vector<Column> m_aoColumns;   ///< Parsed column descriptors.
+};
+
 }  // namespace h2gis
+
+#endif

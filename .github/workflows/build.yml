@@ -1,0 +1,271 @@
+# Builds the H2GIS GDAL plugin for two GDAL versions: the latest stable one
+# and the one of the QGIS LTR.
+#
+# A plugin only loads in the GDAL version (major.minor) it was built for: the
+# GDAL C++ ABI changes between minor versions, and the driver refuses another
+# version (GDAL_CHECK_VERSION). Each binary is named after its platform and
+# GDAL version.
+#
+# On a tag v*, the binaries are attached to a GitHub release.
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  config:
+    name: GDAL versions
+    runs-on: ubuntu-latest
+    outputs:
+      gdal: ${{ steps.versions.outputs.gdal }}
+      linux: ${{ steps.versions.outputs.linux }}
+    steps:
+      # gdal: the GDAL versions to build for on all platforms (major.minor),
+      # the one of the QGIS LTR and the latest stable one. Update them when
+      # GDAL or the QGIS LTR moves to a new minor version (Help > About in
+      # QGIS gives its GDAL version).
+      # linux: the same, plus the GDAL of the LTS distributions, whose QGIS
+      # uses the GDAL of the distribution: Ubuntu 22.04 (3.4), Ubuntu 24.04
+      # (3.8), Debian 13 (3.10). A Linux binary costs one small job.
+      - id: versions
+        run: |
+          echo 'gdal=["3.12", "3.13"]' >> "$GITHUB_OUTPUT"
+          echo 'linux=["3.4", "3.8", "3.10", "3.12", "3.13"]' >> "$GITHUB_OUTPUT"
+
+  # One Linux binary per GDAL version, for every distribution that has this
+  # GDAL version. It is compiled against the GDAL headers of conda-forge, with
+  # the system compiler of an old distribution (Ubuntu 22.04): the binary then
+  # only needs an old glibc and libstdc++, and it links to libgdal.so.<N>,
+  # whose name is set by GDAL itself, the same in all distributions and in
+  # conda-forge. No RPATH: the plugin uses the libgdal of the process that
+  # loads it.
+  linux:
+    name: Linux GDAL ${{ matrix.gdal }}
+    needs: config
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        gdal: ${{ fromJSON(needs.config.outputs.linux) }}
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - name: Install the system compiler
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential curl ca-certificates bzip2 binutils
+      - uses: actions/checkout@v4
+      # conda-forge has libgdal-core since GDAL 3.9, libgdal before
+      - name: GDAL package
+        id: package
+        run: |
+          case "${{ matrix.gdal }}" in
+            3.[0-8]) echo "name=libgdal" >> "$GITHUB_OUTPUT" ;;
+            *) echo "name=libgdal-core" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: build
+          init-shell: bash
+          # GDAL and CMake only: the compiler is the one of the system
+          create-args: >-
+            ${{ steps.package.outputs.name }}=${{ matrix.gdal }}
+            cmake
+            ninja
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" -DCMAKE_SKIP_RPATH=ON
+          cmake --build build
+      - name: Check the dependencies of the plugin
+        run: |
+          readelf -d build/ogr_H2GIS.so | grep -E "NEEDED|RPATH|RUNPATH"
+          if readelf -d build/ogr_H2GIS.so | grep -qE "RPATH|RUNPATH"; then
+            echo "The plugin must not have an RPATH"; exit 1
+          fi
+          echo "glibc required: $(objdump -T build/ogr_H2GIS.so | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+      - name: Check that GDAL loads the plugin
+        run: GDAL_DRIVER_PATH=$PWD/build ogrinfo --formats | grep -F "H2GIS -vector-"
+      - name: Package
+        run: |
+          mkdir dist
+          cp build/ogr_H2GIS.so "dist/ogr_H2GIS-linux-x86_64-gdal${{ matrix.gdal }}.so"
+          ls dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-gdal${{ matrix.gdal }}
+          path: dist/*
+
+  # Loads the Linux binaries in the GDAL of real distributions, with the
+  # binary of the GDAL version of each distribution. A distribution whose
+  # GDAL version has no binary is reported, not failed: it shows which
+  # distributions the binaries cover.
+  linux-distributions:
+    name: Check on ${{ matrix.image }}
+    needs: linux
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: 'ubuntu:22.04', family: debian }
+          - { image: 'ubuntu:24.04', family: debian }
+          - { image: 'ubuntu:26.04', family: debian }
+          - { image: 'debian:13', family: debian }
+          - { image: 'fedora:latest', family: fedora }
+    steps:
+      - name: Install GDAL (Debian, Ubuntu)
+        if: matrix.family == 'debian'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends gdal-bin
+      - name: Install GDAL (Fedora)
+        if: matrix.family == 'fedora'
+        run: dnf install -y gdal
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-gdal*
+          path: dist
+          merge-multiple: true
+      - name: Load the binary of the GDAL version of the distribution
+        run: |
+          version=$(ogrinfo --version | sed -E 's/^GDAL ([0-9]+\.[0-9]+).*/\1/')
+          binary="dist/ogr_H2GIS-linux-x86_64-gdal$version.so"
+          if [ ! -f "$binary" ]; then
+            echo "::notice::${{ matrix.image }} has GDAL $version: no binary for it"
+            exit 0
+          fi
+          mkdir plugins
+          cp "$binary" plugins/ogr_H2GIS.so
+          GDAL_DRIVER_PATH=$PWD/plugins ogrinfo --formats | grep -F "H2GIS -vector-"
+          echo "::notice::${{ matrix.image }} has GDAL $version: OK"
+
+  # QGIS for Windows (OSGeo4W network installer and standalone installers)
+  # uses the GDAL of OSGeo4W. OSGeo4W has a single GDAL version at a time,
+  # used by both QGIS and QGIS LTR: one binary. The conda-forge build of GDAL
+  # is not the same DLL (gdal.dll against gdal3XX.dll) and cannot be used.
+  windows-osgeo4w:
+    name: Windows OSGeo4W
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GDAL from OSGeo4W
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://download.osgeo.org/osgeo4w/v2/osgeo4w-setup.exe -OutFile osgeo4w-setup.exe
+          Start-Process -Wait -FilePath .\osgeo4w-setup.exe -ArgumentList `
+            '--quiet-mode', '--autoaccept', '--advanced', `
+            '--site', 'https://download.osgeo.org/osgeo4w/v2/', `
+            '--root', 'C:\OSGeo4W', '--local-package-dir', "$env:RUNNER_TEMP\osgeo4w", `
+            '--packages', 'gdal-devel'
+          Get-ChildItem C:\OSGeo4W\lib\gdal*.lib
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_PREFIX_PATH=C:/OSGeo4W -DGDAL_ROOT=C:/OSGeo4W
+          cmake --build build --config Release
+      - name: Check that GDAL loads the plugin
+        shell: cmd
+        run: |
+          set PATH=C:\OSGeo4W\bin;%PATH%
+          set GDAL_DRIVER_PATH=%CD%\build\Release
+          ogrinfo --formats | findstr /C:"H2GIS -vector-"
+      - name: Package
+        shell: pwsh
+        run: |
+          # "GDAL 3.12.1, released 2025/12/..." gives 3.12
+          $version = ((& C:\OSGeo4W\bin\gdalinfo.exe --version) -split '[ ,]')[1]
+          $version = ($version -split '\.')[0..1] -join '.'
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item build\Release\ogr_H2GIS.dll "dist\ogr_H2GIS-windows-osgeo4w-gdal$version.dll"
+          Get-ChildItem dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-osgeo4w
+          path: dist/*
+
+  # GDAL of conda-forge on macOS (Apple Silicon) and Windows: QGIS installed
+  # with conda. On Linux, the binaries of the linux job also load in conda.
+  conda:
+    name: conda-forge ${{ matrix.os }} GDAL ${{ matrix.gdal }}
+    needs: config
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+        gdal: ${{ fromJSON(needs.config.outputs.gdal) }}
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: build
+          create-args: >-
+            libgdal-core=${{ matrix.gdal }}
+            cmake
+            ninja
+            ${{ runner.os != 'Windows' && 'cxx-compiler' || '' }}
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" -DCMAKE_SKIP_RPATH=ON
+          cmake --build build
+      - name: Check that GDAL loads the plugin
+        run: |
+          plugins="$PWD/build"
+          # A Windows path for the Windows build of GDAL
+          if [ "${{ runner.os }}" = "Windows" ]; then plugins=$(cygpath -w "$plugins"); fi
+          GDAL_DRIVER_PATH="$plugins" ogrinfo --formats | grep -F "H2GIS -vector-"
+      - name: Package
+        run: |
+          mkdir dist
+          case "${{ runner.os }}" in
+            Windows) cp build/ogr_H2GIS.dll "dist/ogr_H2GIS-conda-windows-gdal${{ matrix.gdal }}.dll" ;;
+            macOS) cp build/ogr_H2GIS.so "dist/ogr_H2GIS-conda-macos-$(uname -m)-gdal${{ matrix.gdal }}.so" ;;
+          esac
+          ls dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conda-${{ matrix.os }}-gdal${{ matrix.gdal }}
+          path: dist/*
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, linux-distributions, windows-osgeo4w, conda]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release with the binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls dist
+          gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" --generate-notes

@@ -1,0 +1,21 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+
+# Native libraries and plugins: published as release assets, never committed
+*.so
+*.dylib
+*.dll
+*.lib
+*.exp
+*.pdb
+
+# H2 databases used for tests
+*.mv.db
+*.trace.db
+
+# Editors
+.vscode/
+.idea/
+*.swp

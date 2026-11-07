@@ -9,7 +9,8 @@
 # Each job tests the plugin with the H2GIS native library of its platform
 # (tests/smoke_test.sh), and packages them together: one zip per platform and
 # GDAL version, with ogr_H2GIS and h2gis side by side. On a tag v*, the zips
-# are attached to a GitHub release.
+# are attached to a GitHub release. A release can also be published by a
+# manual run (Actions > Build > Run workflow), with the tag to create.
 
 name: Build
 
@@ -19,6 +20,15 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Tag of the release to publish (e.g. v0.1.0), created on the commit built. Empty: build only"
+        type: string
+        default: ""
+      prerelease:
+        description: "Publish it as a pre-release"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -283,22 +293,45 @@ jobs:
           name: conda-${{ matrix.os }}-gdal${{ matrix.gdal }}
           path: dist/*
 
+  # On a tag v* pushed, or on a manual run with a release tag. A manual run
+  # creates the tag on the commit built; if the release exists, its zips are
+  # replaced.
   release:
     name: GitHub release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release != '')
     needs: [linux, linux-distributions, windows-osgeo4w, conda]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release || github.ref_name }}
+      PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Create the release with the binaries
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Checksums
         run: |
-          ls dist
-          gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" \
-            --title "${{ github.ref_name }}" --generate-notes
+          cd dist
+          sha256sum *.zip > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create or update the release
+        run: |
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "The tag must start with v and a digit, e.g. v0.1.0: $TAG"; exit 1 ;;
+          esac
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG exists: its files are replaced"
+            gh release upload "$TAG" dist/* --clobber
+          else
+            options=()
+            if [ "$PRERELEASE" = "true" ]; then options+=(--prerelease); fi
+            # --target: the tag is created on the commit built (manual run)
+            gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "$TAG" \
+              --generate-notes "${options[@]}"
+          fi
+          echo "::notice::Release $TAG: https://github.com/$GH_REPO/releases/tag/$TAG"

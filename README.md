@@ -4,8 +4,6 @@ A GDAL/OGR vector driver for [H2GIS](https://www.h2gis.org) databases
 (`.mv.db` files), built as a plugin outside of the GDAL distribution.
 It uses the H2GIS native library (GraalVM native image / Mandrel).
 
-Status: prototype, read and write.
-
 ## Requirements
 
 - GDAL with its development files (headers and CMake config). The plugin must
@@ -181,7 +179,7 @@ ogr2ogr -update -append -doo AUTO_SERVER=YES mydb.mv.db roads.geojson -nln ROADS
 | Option | Default | Description |
 |---|---|---|
 | `GEOMETRY_NAME` | `THE_GEOM` | Name of the geometry column |
-| `FID` | `ID` | Name of the FID column (`BIGINT` identity primary key). <br/>A field of the data with this name is refused: give the FID column another name |
+| `FID` | `FID` | Name of the FID column (`BIGINT` identity primary key). <br/>A field of the data with this name is refused: give the FID column another name |
 | `SPATIAL_INDEX` | `YES` | Create a spatial index, when the dataset is closed |
 | `LAUNDER` | `YES` | Names of the table and of its columns in upper case letters, digits and `_` |
 | `OVERWRITE` | `NO` | Replace an existing table of the same name (refused if a view depends on it) |

@@ -11,6 +11,7 @@
  * ends.
  *
  * This code is part of the H2GIS project, LGPL 3.0.
+ * @author Erwan Bocher, CNRS
  */
 #ifndef H2GIS_NATIVE_H
 #define H2GIS_NATIVE_H

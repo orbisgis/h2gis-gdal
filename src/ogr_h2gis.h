@@ -2,6 +2,7 @@
  * H2GIS driver for GDAL/OGR.
  *
  * This code is part of the H2GIS project, LGPL 3.0.
+ * @author Erwan Bocher, CNRS
  */
 #ifndef OGR_H2GIS_H
 #define OGR_H2GIS_H

@@ -7,6 +7,7 @@
  * returned.
  *
  * This code is part of the H2GIS project, LGPL 3.0.
+ * @author Erwan Bocher, CNRS
  */
 #include "ogr_h2gis.h"
 

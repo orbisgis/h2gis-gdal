@@ -4,6 +4,7 @@
  * Access to the H2GIS native library (GraalVM native image based on Mandrel, C API >= 3).
  *
  * This code is part of the H2GIS project, LGPL 3.0.
+ * @author Erwan Bocher, CNRS
  */
 #include "h2gis_native.h"
 

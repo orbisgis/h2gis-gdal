@@ -6,7 +6,10 @@
 # version (GDAL_CHECK_VERSION). Each binary is named after its platform and
 # GDAL version.
 #
-# On a tag v*, the binaries are attached to a GitHub release.
+# Each job tests the plugin with the H2GIS native library of its platform
+# (tests/smoke_test.sh), and packages them together: one zip per platform and
+# GDAL version, with ogr_H2GIS and h2gis side by side. On a tag v*, the zips
+# are attached to a GitHub release.
 
 name: Build
 
@@ -19,6 +22,11 @@ on:
 
 permissions:
   contents: read
+
+env:
+  # The H2GIS native libraries, published by the CI of H2GIS: the snapshot of
+  # master, or the release of a version (.../releases/download/v2.2.6).
+  H2GIS_NATIVE_URL: https://github.com/orbisgis/H2GIS/releases/download/graalvm-snapshot
 
 jobs:
   config:
@@ -65,7 +73,7 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends build-essential curl ca-certificates bzip2 binutils
+          apt-get install -y --no-install-recommends build-essential curl ca-certificates bzip2 binutils zip
       - uses: actions/checkout@v4
       # conda-forge has libgdal-core since GDAL 3.9, libgdal before
       - name: GDAL package
@@ -96,19 +104,21 @@ jobs:
             echo "The plugin must not have an RPATH"; exit 1
           fi
           echo "glibc required: $(objdump -T build/ogr_H2GIS.so | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
-      - name: Check that GDAL loads the plugin
-        run: GDAL_DRIVER_PATH=$PWD/build ogrinfo --formats | grep -F "H2GIS -vector-"
+      - name: Download the H2GIS native library
+        run: bash .github/scripts/download-h2gis.sh h2gis-linux-x86_64.so build/h2gis.so
+      - name: Test
+        run: GDAL_DRIVER_PATH=$PWD/build bash tests/smoke_test.sh
       - name: Package
         run: |
           mkdir dist
-          cp build/ogr_H2GIS.so "dist/ogr_H2GIS-linux-x86_64-gdal${{ matrix.gdal }}.so"
-          ls dist
+          zip -j "dist/ogr_H2GIS-linux-x86_64-gdal${{ matrix.gdal }}.zip" build/ogr_H2GIS.so build/h2gis.so
+          ls -l dist
       - uses: actions/upload-artifact@v4
         with:
           name: linux-gdal${{ matrix.gdal }}
           path: dist/*
 
-  # Loads the Linux binaries in the GDAL of real distributions, with the
+  # Tests the Linux binaries in the GDAL of real distributions, with the
   # binary of the GDAL version of each distribution. A distribution whose
   # GDAL version has no binary is reported, not failed: it shows which
   # distributions the binaries cover.
@@ -126,6 +136,9 @@ jobs:
           - { image: 'ubuntu:26.04', family: debian }
           - { image: 'debian:13', family: debian }
           - { image: 'fedora:latest', family: fedora }
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Install GDAL (Debian, Ubuntu)
         if: matrix.family == 'debian'
@@ -133,26 +146,26 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends gdal-bin
+          apt-get install -y --no-install-recommends gdal-bin unzip
       - name: Install GDAL (Fedora)
         if: matrix.family == 'fedora'
-        run: dnf install -y gdal
+        run: dnf install -y gdal unzip
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: linux-gdal*
           path: dist
           merge-multiple: true
-      - name: Load the binary of the GDAL version of the distribution
+      - name: Test the binary of the GDAL version of the distribution
         run: |
           version=$(ogrinfo --version | sed -E 's/^GDAL ([0-9]+\.[0-9]+).*/\1/')
-          binary="dist/ogr_H2GIS-linux-x86_64-gdal$version.so"
-          if [ ! -f "$binary" ]; then
+          package="dist/ogr_H2GIS-linux-x86_64-gdal$version.zip"
+          if [ ! -f "$package" ]; then
             echo "::notice::${{ matrix.image }} has GDAL $version: no binary for it"
             exit 0
           fi
-          mkdir plugins
-          cp "$binary" plugins/ogr_H2GIS.so
-          GDAL_DRIVER_PATH=$PWD/plugins ogrinfo --formats | grep -F "H2GIS -vector-"
+          unzip -d plugins "$package"
+          GDAL_DRIVER_PATH=$PWD/plugins bash tests/smoke_test.sh
           echo "::notice::${{ matrix.image }} has GDAL $version: OK"
 
   # QGIS for Windows (OSGeo4W network installer and standalone installers)
@@ -188,12 +201,16 @@ jobs:
           cmake -S . -B build -A x64 `
             "-DGDAL_LIBRARY=$lib" -DGDAL_INCLUDE_DIR=C:/OSGeo4W/include
           cmake --build build --config Release
-      - name: Check that GDAL loads the plugin
-        shell: cmd
+      - name: Download the H2GIS native library
+        shell: bash
+        run: bash .github/scripts/download-h2gis.sh h2gis-windows-x86_64.dll build/Release/h2gis.dll
+      - name: Test
+        shell: bash
         run: |
-          set PATH=C:\OSGeo4W\bin;%PATH%
-          set GDAL_DRIVER_PATH=%CD%\build\Release
-          ogrinfo --formats | findstr /C:"H2GIS -vector-"
+          export PATH="/c/OSGeo4W/bin:$PATH"
+          export GDAL_DATA='C:\OSGeo4W\apps\gdal\share\gdal' PROJ_DATA='C:\OSGeo4W\share\proj' PROJ_LIB='C:\OSGeo4W\share\proj'
+          export GDAL_DRIVER_PATH=$(cygpath -w "$PWD/build/Release")
+          bash tests/smoke_test.sh
       - name: Package
         shell: pwsh
         run: |
@@ -201,7 +218,8 @@ jobs:
           $version = ((& C:\OSGeo4W\bin\gdalinfo.exe --version) -split '[ ,]')[1]
           $version = ($version -split '\.')[0..1] -join '.'
           New-Item -ItemType Directory dist | Out-Null
-          Copy-Item build\Release\ogr_H2GIS.dll "dist\ogr_H2GIS-windows-osgeo4w-gdal$version.dll"
+          Compress-Archive -Path build\Release\ogr_H2GIS.dll, build\Release\h2gis.dll `
+            -DestinationPath "dist\ogr_H2GIS-windows-osgeo4w-gdal$version.zip"
           Get-ChildItem dist
       - uses: actions/upload-artifact@v4
         with:
@@ -239,20 +257,27 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" -DCMAKE_SKIP_RPATH=ON
           cmake --build build
-      - name: Check that GDAL loads the plugin
+      - name: Download the H2GIS native library
+        run: |
+          case "${{ runner.os }}" in
+            Windows) bash .github/scripts/download-h2gis.sh h2gis-windows-x86_64.dll build/h2gis.dll ;;
+            # macos-latest runs on Apple Silicon
+            macOS) bash .github/scripts/download-h2gis.sh h2gis-macos-arm64.dylib build/h2gis.dylib ;;
+          esac
+      - name: Test
         run: |
           plugins="$PWD/build"
           # A Windows path for the Windows build of GDAL
           if [ "${{ runner.os }}" = "Windows" ]; then plugins=$(cygpath -w "$plugins"); fi
-          GDAL_DRIVER_PATH="$plugins" ogrinfo --formats | grep -F "H2GIS -vector-"
+          GDAL_DRIVER_PATH="$plugins" bash tests/smoke_test.sh
       - name: Package
         run: |
           mkdir dist
           case "${{ runner.os }}" in
-            Windows) cp build/ogr_H2GIS.dll "dist/ogr_H2GIS-conda-windows-gdal${{ matrix.gdal }}.dll" ;;
-            macOS) cp build/ogr_H2GIS.so "dist/ogr_H2GIS-conda-macos-$(uname -m)-gdal${{ matrix.gdal }}.so" ;;
+            Windows) (cd build && 7z a -tzip "../dist/ogr_H2GIS-conda-windows-gdal${{ matrix.gdal }}.zip" ogr_H2GIS.dll h2gis.dll) ;;
+            macOS) zip -j "dist/ogr_H2GIS-conda-macos-$(uname -m)-gdal${{ matrix.gdal }}.zip" build/ogr_H2GIS.so build/h2gis.dylib ;;
           esac
-          ls dist
+          ls -l dist
       - uses: actions/upload-artifact@v4
         with:
           name: conda-${{ matrix.os }}-gdal${{ matrix.gdal }}

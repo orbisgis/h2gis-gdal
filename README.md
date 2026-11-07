@@ -67,14 +67,12 @@ export GDAL_DRIVER_PATH=/path/to/build
 export H2GIS_LIBRARY=/path/to/h2gis.so  
 ogrinfo --formats | grep H2GIS # Check driver
 
-# Create a new database
-ogr2ogr -f H2GIS new.mv.db data.gpkg
 # Create an empty database
 ogrinfo -oo CREATE_IF_MISSING=YES empty.mv.db
 
 # List tables
 ogrinfo -ro mydb.mv.db 
-# Export a table
+# Import a file
 ogr2ogr -f GeoJSON roads.geojson mydb.mv.db ROADS
 # Update a table
 ogr2ogr -update -append mydb.mv.db roads.geojson -nln ROADS
@@ -159,7 +157,7 @@ ogr2ogr -update -append -doo AUTO_SERVER=YES mydb.mv.db roads.geojson -nln ROADS
 | Option | Default | Description |
 |---|---|---|
 | `GEOMETRY_NAME` | `THE_GEOM` | Name of the geometry column |
-| `FID` | `ID` | Name of the FID column (`BIGINT` identity primary key) |
+| `FID` | `ID` | Name of the FID column (`BIGINT` identity primary key). <br/>A field of the data with this name is refused: give the FID column another name |
 | `SPATIAL_INDEX` | `YES` | Create a spatial index, when the dataset is closed |
 | `LAUNDER` | `YES` | Names of the table and of its columns in upper case letters, digits and `_` |
 | `OVERWRITE` | `NO` | Replace an existing table of the same name (refused if a view depends on it) |

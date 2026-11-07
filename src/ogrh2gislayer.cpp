@@ -918,7 +918,16 @@ OGRErr OGRH2GISTableLayer::CreateField(H2GIS_FIELDDEFN *poField, int bApproxOK)
     }
     GetLayerDefn();
     const std::string osName = m_bLaunder ? H2GISLaunderName(poField->GetNameRef()) : poField->GetNameRef();
-    if (m_poFeatureDefn->GetFieldIndex(osName.c_str()) >= 0 || osName == m_osFIDColumn)
+    if (osName == m_osFIDColumn)
+    {
+        // Not merged with the FID: the values of the field may not be unique
+        CPLError(CE_Failure, CPLE_AppDefined,
+                 "H2GIS: field %s has the name of the FID column of %s. Give the FID column another name "
+                 "with the layer creation option FID (ogr2ogr -lco FID=...).",
+                 osName.c_str(), m_osName.c_str());
+        return OGRERR_FAILURE;
+    }
+    if (m_poFeatureDefn->GetFieldIndex(osName.c_str()) >= 0)
     {
         CPLError(CE_Failure, CPLE_AppDefined, "H2GIS: field %s already exists in %s", osName.c_str(),
                  m_osName.c_str());

@@ -956,7 +956,9 @@ OGRLayer *OGRH2GISDataSource::CreateTable(const char *pszName, OGRwkbGeometryTyp
     }
     const bool bLaunder = CPLFetchBool(papszOptions, "LAUNDER", true);
     const std::string osTable = bLaunder ? H2GISLaunderName(pszName) : std::string(pszName);
-    const char *pszFID = CSLFetchNameValueDef(papszOptions, "FID", "ID");
+    // FID, like the fid of GeoPackage: a technical key that does not meet the
+    // ID fields of the data, whose values may not be unique
+    const char *pszFID = CSLFetchNameValueDef(papszOptions, "FID", "FID");
     const std::string osFID = bLaunder ? H2GISLaunderName(pszFID) : std::string(pszFID);
     const char *pszGeom = CSLFetchNameValueDef(papszOptions, "GEOMETRY_NAME", "THE_GEOM");
     const std::string osGeom = bLaunder ? H2GISLaunderName(pszGeom) : std::string(pszGeom);
@@ -1103,7 +1105,7 @@ void RegisterOGRH2GIS()
         "<LayerCreationOptionList>"
         "  <Option name='GEOMETRY_NAME' type='string' description='Name of the geometry column' "
         "default='THE_GEOM'/>"
-        "  <Option name='FID' type='string' description='Name of the FID column' default='ID'/>"
+        "  <Option name='FID' type='string' description='Name of the FID column' default='FID'/>"
         "  <Option name='SPATIAL_INDEX' type='boolean' description='Whether to create a spatial "
         "index, when the dataset is closed' default='YES'/>"
         "  <Option name='LAUNDER' type='boolean' description='Whether to change the names of the "

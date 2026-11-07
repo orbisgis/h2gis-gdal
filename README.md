@@ -78,15 +78,28 @@ export GDAL_DRIVER_PATH=$PWD/build
 ogrinfo -ro /tmp/migisdb.mv.db
 bash tests/smoke_test.sh
 ```
-## Use
+
+## Auto install
 
 GDAL loads the plugins of the directories listed in `GDAL_DRIVER_PATH`. The
 native library is searched in the `H2GIS_LIBRARY` configuration option, then
 next to the plugin, then in the default library path.
 
+A python script is provided to automatically install the last release of the H2GIS GDAL driver.
+To check the releases go to https://github.com/orbisgis/h2gis-gdal/releases
+
 ```sh
-export GDAL_DRIVER_PATH=/path/to/build
-export H2GIS_LIBRARY=/path/to/h2gis.so  
+# Go to the scripts folder. Run one of the following commands.
+# Note : You can also download and run this script alone.
+python3 install_h2gis_driver.py                    # Install the most recent release
+python3 install_h2gis_driver.py --release v0.0.1   # Install a specific release
+python3 install_h2gis_driver.py --dest DIR         # Install into another directory
+python3 install_h2gis_driver.py --uninstall        # Uninstall the driver
+```
+
+## Use
+
+```sh
 ogrinfo --formats | grep H2GIS # Check driver
 
 # Create an empty database
@@ -99,10 +112,6 @@ ogr2ogr -f GeoJSON roads.geojson mydb.mv.db ROADS
 # Update a table
 ogr2ogr -update -append mydb.mv.db roads.geojson -nln ROADS
 ```
-
-In QGIS, set `GDAL_DRIVER_PATH` (and `H2GIS_LIBRARY` if needed) in
-*Settings > Options > System > Environment* and restart QGIS. The plugin must
-be built for the GDAL version of QGIS.
 
 A database can also be opened with the `H2GIS:` prefix, without extension:
 `ogrinfo H2GIS:/path/to/mydb`.

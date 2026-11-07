@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       release:
-        description: "Tag of the release to publish (e.g. v0.1.0), created on the commit built. Empty: build only"
+        description: "Version of the release to publish (v0.1.0 or 0.1.0), tagged on the commit built. Empty: build only"
         type: string
         default: ""
       prerelease:
@@ -309,21 +309,35 @@ jobs:
       TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release || github.ref_name }}
       PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      - name: Version
+        run: |
+          # The tags have the form v0.1.0: add the v to a version given as 0.1.0
+          if [[ "$TAG" =~ ^[0-9] ]]; then
+            TAG="v$TAG"
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9] ]]; then
+            echo "The tag must be a version, e.g. v0.1.0 or 0.1.0: $TAG"
+            exit 1
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "Tag: $TAG"
+      - name: Installation script
+        run: |
+          # The script of the release installs the zips of this release
+          sed "s/^RELEASE = \"latest\"/RELEASE = \"$TAG\"/" scripts/install_h2gis_driver.py > dist/install_h2gis_driver.py
+          grep -n '^RELEASE = ' dist/install_h2gis_driver.py
       - name: Checksums
         run: |
           cd dist
-          sha256sum *.zip > SHA256SUMS
+          sha256sum *.zip install_h2gis_driver.py > SHA256SUMS
           cat SHA256SUMS
       - name: Create or update the release
         run: |
-          case "$TAG" in
-            v[0-9]*) ;;
-            *) echo "The tag must start with v and a digit, e.g. v0.1.0: $TAG"; exit 1 ;;
-          esac
           if gh release view "$TAG" > /dev/null 2>&1; then
             echo "Release $TAG exists: its files are replaced"
             gh release upload "$TAG" dist/* --clobber

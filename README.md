@@ -48,7 +48,16 @@ The official QGIS application for macOS ships its own GDAL build is not covered 
 ## Build
 
 ```sh
+# Go to the root of the repository
+cd ../../h2gis-gdal
+# Delete the folder that contains the build of the h2gis-gdal lib
+rm -rf build
+# Prepare the compilation
+# -S .        sources in the current directory (where CMakeLists.txt is)
+# -B build    build files and result in build/, created if needed
+# -DCMAKE_BUILD_TYPE=Release  optimized build, without debug information 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+# Run the compilation. It produces the ogr_H2GIS.so lib in build folder
 cmake --build build
 ```
 
@@ -56,6 +65,21 @@ If CMake finds another GDAL than the one QGIS uses, give its prefix:
 `-DCMAKE_PREFIX_PATH=$(gdal-config --prefix)`, or `$CONDA_PREFIX` in a conda
 environment. This produces `build/ogr_H2GIS.so` (`ogr_H2GIS.dll` on Windows).
 
+### Run H2GIS driver and tests from the root folder 
+```sh
+# Go to the root of the repository
+# Download the H2GIS native library for Linux next to the plugin.
+# H2GIS_NATIVE_URL: the GitHub release of H2GIS to download it from
+#   (graalvm-snapshot: the latest build of master; or a version, e.g. .../download/v2.2.6).
+# The script downloads the library (h2gis-linux-x86_64.so) and the SHA256SUMS of the
+# release, checks the checksum, and saves the library as build/h2gis.so: the name and
+# the place where the plugin looks for it.
+H2GIS_NATIVE_URL=https://github.com/orbisgis/H2GIS/releases/download/graalvm-snapshot \
+  bash .github/scripts/download-h2gis.sh h2gis-linux-x86_64.so build/h2gis.so
+export GDAL_DRIVER_PATH=$PWD/build
+ogrinfo -ro /tmp/migisdb.mv.db
+bash tests/smoke_test.sh
+```
 ## Use
 
 GDAL loads the plugins of the directories listed in `GDAL_DRIVER_PATH`. The

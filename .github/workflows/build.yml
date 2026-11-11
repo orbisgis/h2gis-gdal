@@ -346,7 +346,7 @@ jobs:
       - name: Installation script
         run: |
           # The script of the release installs the zips of this release
-          sed "s/^RELEASE = \"latest\"/RELEASE = \"$TAG\"/" scripts/install_h2gis_driver.py > dist/install_h2gis_driver.py
+          sed "s/^RELEASE = \"latest\"/RELEASE = \"$TAG\"/" .github/scripts/install_h2gis_driver.py > dist/install_h2gis_driver.py
           grep -n '^RELEASE = ' dist/install_h2gis_driver.py
       - name: Checksums
         run: |

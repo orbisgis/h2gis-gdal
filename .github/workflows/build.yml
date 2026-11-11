@@ -144,56 +144,56 @@ jobs:
     name: Check on ${{ matrix.image }}
     needs: linux
     runs-on: ubuntu-latest
-    container: ${{ matrix.image }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { image: 'ubuntu:22.04', family: debian }
-          - { image: 'ubuntu:24.04', family: debian }
-          - { image: 'ubuntu:26.04', family: debian }
-          - { image: 'debian:13', family: debian }
-          - { image: 'fedora:latest', family: fedora }
-    defaults:
-      run:
-        shell: bash
+          - { image: 'ubuntu:22.04', install: 'apt-get update && apt-get install -y --no-install-recommends gdal-bin unzip' }
+          - { image: 'ubuntu:24.04', install: 'apt-get update && apt-get install -y --no-install-recommends gdal-bin unzip' }
+          - { image: 'ubuntu:26.04', install: 'apt-get update && apt-get install -y --no-install-recommends gdal-bin unzip' }
+          - { image: 'debian:13', install: 'apt-get update && apt-get install -y --no-install-recommends gdal-bin unzip' }
+          - { image: 'fedora:latest', install: 'dnf install -y gdal unzip' }
     steps:
-      - name: Install GDAL (Debian, Ubuntu)
-        if: matrix.family == 'debian'
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          # The DNS of the container sometimes fails for a moment on the
-          # GitHub runners (apt-get update then only warns): retry
-          for attempt in 1 2 3 4 5; do
-            if apt-get update -o Acquire::Retries=3 &&
-               apt-get install -y --no-install-recommends gdal-bin unzip; then
-              break
-            fi
-            if [ "$attempt" = 5 ]; then exit 1; fi
-            echo "apt-get failed (attempt $attempt), retrying in 20 s"
-            sleep 20
-          done
-      - name: Install GDAL (Fedora)
-        if: matrix.family == 'fedora'
-        run: dnf install -y gdal unzip
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: linux-gdal*
           path: dist
           merge-multiple: true
+      # The distribution runs with docker run --network host, not as a job
+      # container: a job container has its own network, whose DNS fails on
+      # the GitHub runners ("Could not resolve 'archive.ubuntu.com'"). With
+      # the network of the runner, the container uses the DNS of the runner.
       - name: Test the binary of the GDAL version of the distribution
+        env:
+          IMAGE: ${{ matrix.image }}
+          INSTALL: ${{ matrix.install }}
         run: |
+          cat > "$RUNNER_TEMP/check.sh" << 'EOF'
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          # A network failure of a moment: retry
+          for attempt in 1 2 3; do
+            if sh -c "$INSTALL"; then break; fi
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            echo "Install failed (attempt $attempt), retrying in 20 s"
+            sleep 20
+          done
           version=$(ogrinfo --version | sed -E 's/^GDAL ([0-9]+\.[0-9]+).*/\1/')
           package="dist/ogr_H2GIS-linux-x86_64-gdal$version.zip"
           if [ ! -f "$package" ]; then
-            echo "::notice::${{ matrix.image }} has GDAL $version: no binary for it"
+            echo "::notice::$IMAGE has GDAL $version: no binary for it"
             exit 0
           fi
+          rm -rf plugins
           unzip -d plugins "$package"
           GDAL_DRIVER_PATH=$PWD/plugins bash tests/smoke_test.sh
-          echo "::notice::${{ matrix.image }} has GDAL $version: OK"
+          echo "::notice::$IMAGE has GDAL $version: OK"
+          EOF
+          docker run --rm --network host \
+            -e IMAGE -e INSTALL \
+            -v "$GITHUB_WORKSPACE:/work" -v "$RUNNER_TEMP/check.sh:/check.sh:ro" \
+            -w /work "$IMAGE" bash /check.sh
 
   # QGIS for Windows (OSGeo4W network installer and standalone installers)
   # uses the GDAL of OSGeo4W. OSGeo4W has a single GDAL version at a time,

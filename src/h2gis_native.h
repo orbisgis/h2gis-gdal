@@ -92,6 +92,17 @@ struct Api
     int (*version)(Thread *);
 
     /**
+     * @brief Returns the versions built into the library, as JSON:
+     *        {"cApi":4,"h2gis":"2.2.6","h2":"2.5.252","jts":"1.20.0"}.
+     * @param thread Thread handle.
+     * @return Newly allocated null-terminated string; must be released with
+     *         free_string() (see TakeString()). Null with a library older
+     *         than the C API version 4, which has no such function: the
+     *         caller then asks H2 (SELECT H2VERSION(), H2GISVERSION()).
+     */
+    char *(*get_versions)(Thread *);
+
+    /**
      * @brief Returns the last error message of the calling thread.
      * @param thread Thread handle.
      * @return Newly allocated null-terminated string; must be released with

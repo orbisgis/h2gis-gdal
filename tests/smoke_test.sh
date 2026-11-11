@@ -33,6 +33,7 @@ check "missing database refused" "unable to open" "$(ogrinfo -ro missing.mv.db 2
 out=$(ogrinfo -oo CREATE_IF_MISSING=YES $db 2>&1)
 check "database created" "successful" "$out"
 check "H2GIS functions" "V (String) = 2." "$(ogrinfo -ro $db -sql "SELECT H2GISVERSION() AS V" 2>&1)"
+check "H2 version in the metadata" "H2_VERSION=2." "$(ogrinfo -ro $db 2>&1)"
 
 ogrinfo $db -sql "CREATE TABLE PTS(ID INT PRIMARY KEY, NAME VARCHAR, THE_GEOM GEOMETRY(POINT, 0))" > /dev/null 2>&1
 ogrinfo $db -sql "INSERT INTO PTS VALUES (1, 'a', 'POINT(0 0)'), (2, 'b', 'POINT(10 0)'), (3, 'c', 'POINT(0 10)')" > /dev/null 2>&1

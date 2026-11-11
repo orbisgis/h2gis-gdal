@@ -427,6 +427,8 @@ class OGRH2GISDataSource final : public GDALDataset
     static Affected AffectedTables(const char *pszStatement, const std::string &osKeyword,
                                    std::vector<std::pair<std::string, std::string>> &aoTables);
     void FinishWriting();
+    /** Metadata items H2_VERSION, H2GIS_VERSION and JTS_VERSION of the dataset. */
+    void SetVersionMetadata();
 
     long long m_hConnection = 0;
     bool m_bUpdate = false;

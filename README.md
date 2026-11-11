@@ -43,6 +43,73 @@ one `h2gis.dll` for Windows, one `h2gis.dylib` per macOS processor.
 
 The official QGIS application for macOS ships its own GDAL build is not covered yet.
 
+## Version
+
+This driver is linked to a specific version of the H2 database: the H2GIS
+native library embeds one version of H2GIS, of H2 and of JTS (e.g H2 2.5.252 for
+H2GIS 2.2.6).
+
+`ogrinfo` shows the versions of the library in the metadata of a database
+(`JTS_VERSION` with a library of C API version 4 or later):
+
+```
+Metadata:
+  H2GIS_VERSION=2.2.6
+  H2_VERSION=2.5.252
+  JTS_VERSION=1.20.0
+```
+
+### A database that does not open
+
+If a database does not open, it may have been written by another version of
+H2: H2 does not read the files of some other versions. The driver says so in
+its error message, for example with a database written by H2 2.4.240:
+
+```
+ERROR 4: H2GIS: cannot open the database: Failed to open H2 connection:
+File corrupted while reading record: "mydb.mv.db". Possible solution: use the
+recovery tool [90030-252] The database may have been written by another version
+of H2 than the one of the H2GIS native library (H2 2.5.252) ...
+```
+
+To solve this issue, the database must be opened with the version of H2 that wrote
+it, which needs Java and the H2 jar of this version.
+
+**1. Close the database cleanly with its own version of H2.** A database that
+was not closed cleanly (a process killed, a crash) keeps rows in the state of
+their transaction, and newer versions of H2 store them differently. Opening
+and closing it once with its own version is often enough:
+
+```bash
+java -cp h2-2.4.240.jar org.h2.tools.Shell -url jdbc:h2:/path/to/mydb -user sa -sql "SELECT H2VERSION()"
+ogrinfo -ro mydb.mv.db
+```
+
+**2. Otherwise, migrate the tables in SQL.** Export the tables with the old
+version of H2, then import them in a new database created by the driver:
+
+```bash
+# List the tables of the old database
+java -cp h2-2.4.240.jar org.h2.tools.Shell -url jdbc:h2:/path/to/mydb -user sa -sql "SHOW TABLES"
+# Export the tables (data, indexes and constraints) in an SQL script.
+# TABLE: only these tables, not SPATIAL_REF_SYS that the new database already has
+java -cp h2-2.4.240.jar org.h2.tools.Script -url jdbc:h2:/path/to/mydb -user sa \
+     -script dump.sql -options TABLE BUILDINGS,ROADS
+# Remove the H2GIS functions from the script: the new database already has them
+grep -v -E '^CREATE FORCE (ALIAS|AGGREGATE) ' dump.sql > tables.sql
+# Create the new database and run the script in it
+ogrinfo -oo CREATE_IF_MISSING=YES newdb.mv.db -sql "RUNSCRIPT FROM 'tables.sql'"
+ogrinfo -ro newdb.mv.db
+```
+
+On Windows, replace the `grep` command by
+`findstr /v /b /c:"CREATE FORCE ALIAS " /c:"CREATE FORCE AGGREGATE " dump.sql > tables.sql`.
+
+[H2MigrationTool](https://github.com/manticore-projects/H2MigrationTool) is
+another way to migrate a database between versions of H2.
+
+
+
 ## Build
 
 ```sh

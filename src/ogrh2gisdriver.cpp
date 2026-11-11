@@ -108,6 +108,105 @@ std::string LikeEscape(const std::string &osValue)
     return osEscaped;
 }
 
+/** Versions of H2, H2GIS and JTS built into the native library. */
+struct NativeVersions
+{
+    std::string osH2;
+    std::string osH2GIS;
+    std::string osJTS;  // C API 4 only: H2 does not know it
+};
+
+/** Trailing spaces removed: H2GISVERSION() ends with a space. */
+std::string TrimRight(std::string osValue)
+{
+    while (!osValue.empty() && isspace(static_cast<unsigned char>(osValue.back())))
+        osValue.pop_back();
+    return osValue;
+}
+
+/**
+ * Versions of the native library, read once: from h2gis_get_versions (C API
+ * 4), else from H2 itself, on an in-memory database. Empty if unknown.
+ */
+NativeVersions ReadNativeVersions()
+{
+    NativeVersions oVersions;
+    const h2gis::Api *poApi = h2gis::GetApi();
+    h2gis::Thread *pThread = poApi != nullptr ? h2gis::CurrentThread() : nullptr;
+    if (pThread == nullptr)
+        return oVersions;
+    if (poApi->get_versions != nullptr)
+    {
+        CPLJSONDocument oDoc;
+        if (oDoc.LoadMemory(h2gis::TakeString(poApi->get_versions(pThread))))
+        {
+            oVersions.osH2 = oDoc.GetRoot().GetString("h2");
+            oVersions.osH2GIS = oDoc.GetRoot().GetString("h2gis");
+            oVersions.osJTS = oDoc.GetRoot().GetString("jts");
+        }
+        return oVersions;
+    }
+    // An older library: ask H2
+    const long long hConnection = poApi->connect(pThread, "mem:", "sa", "");
+    if (hConnection <= 0)
+    {
+        h2gis::TakeString(poApi->get_last_error(pThread));
+        return oVersions;
+    }
+    const long long hResult = poApi->fetch(pThread, hConnection, "SELECT H2VERSION(), H2GISVERSION()");
+    if (hResult > 0)
+    {
+        long long nSize = 0;
+        // Two statements: fetch_batch sets nSize, read after it
+        void *pBuffer = poApi->fetch_batch(pThread, hResult, 1, &nSize);
+        h2gis::ResultBuffer oBuffer;
+        if (oBuffer.Reset(pBuffer, nSize) && oBuffer.GetRowCount() == 1 && oBuffer.GetColumnCount() == 2)
+        {
+            std::string *aposValues[] = {&oVersions.osH2, &oVersions.osH2GIS};
+            for (int i = 0; i < 2; i++)
+            {
+                uint32_t nLength = 0;
+                const uint8_t *pabyValue = oBuffer.IsNull(i, 0) ? nullptr : oBuffer.GetBytes(i, 0, nLength);
+                if (pabyValue != nullptr)
+                    *aposValues[i] = TrimRight(std::string(reinterpret_cast<const char *>(pabyValue), nLength));
+            }
+        }
+        poApi->close_query(pThread, hResult);
+    }
+    poApi->close_connection(pThread, hConnection);
+    return oVersions;
+}
+
+const NativeVersions &GetNativeVersions()
+{
+    static const NativeVersions oVersions = ReadNativeVersions();
+    return oVersions;
+}
+
+/**
+ * Report an error of h2gis_connect. H2 reports a database written by
+ * another version of H2 as corrupted (90030), as both versions can write the
+ * same file format number, or of an unsupported version (90048): say so,
+ * unless the library already does (C API 4).
+ */
+void ReportConnectError(const std::string &osError)
+{
+    std::string osHint;
+    if ((osError.find("90030-") != std::string::npos || osError.find("90048-") != std::string::npos) &&
+        osError.find("another version of H2") == std::string::npos)
+    {
+        const NativeVersions &oVersions = GetNativeVersions();
+        osHint = " The database may have been written by another version of H2 than the one of the H2GIS native "
+                 "library (H2 " +
+                 (oVersions.osH2.empty() ? std::string("unknown") : oVersions.osH2) +
+                 "): H2 does not read the files of some other versions. Use the same version of H2 to write it, "
+                 "or export it in SQL with its version of H2 (SCRIPT TO) and import the script in a database "
+                 "created by H2GIS (RUNSCRIPT FROM).";
+    }
+    CPLError(CE_Failure, CPLE_OpenFailed, "H2GIS: cannot open the database: %s%s",
+             osError.empty() ? "unknown error" : osError.c_str(), osHint.c_str());
+}
+
 }  // namespace
 
 std::string H2GISGeometryColumnType(OGRwkbGeometryType eGType, int nSRID)
@@ -243,7 +342,7 @@ bool OGRH2GISDataSource::Connect(const std::string &osURL, const char *pszUser, 
     if (m_hConnection <= 0)
     {
         m_hConnection = 0;
-        h2gis::ReportLastError("cannot open the database");
+        ReportConnectError(h2gis::TakeString(poApi->get_last_error(pThread)));
         return false;
     }
     return true;
@@ -309,6 +408,7 @@ bool OGRH2GISDataSource::Open(GDALOpenInfo *poOpenInfo)
     if (!LoadLayers(pszSchemas, nullptr, m_bSpatialOnly))
         return false;
     SetDescription(poOpenInfo->pszFilename);
+    SetVersionMetadata();
     return true;
 }
 
@@ -344,7 +444,7 @@ bool OGRH2GISDataSource::CheckH2GIS(const std::string &osPath, const char *pszUs
         CPLDebug("H2GIS", "%s%s is opened by another process: not checked", osPath.c_str(), EXTENSION);
         return true;
     }
-    CPLError(CE_Failure, CPLE_OpenFailed, "H2GIS: cannot open the database: %s", osError.c_str());
+    ReportConnectError(osError);
     return false;
 }
 
@@ -362,7 +462,21 @@ bool OGRH2GISDataSource::Create(const char *pszFilename)
     if (!Connect(osPath + ConnectionOptions(), "sa", ""))
         return false;
     SetDescription(pszFilename);
+    SetVersionMetadata();
     return true;
+}
+
+void OGRH2GISDataSource::SetVersionMetadata()
+{
+    // The version of H2 decides which database files can be read: H2 does
+    // not read the files written by some other versions
+    const NativeVersions &oVersions = GetNativeVersions();
+    if (!oVersions.osH2.empty())
+        SetMetadataItem("H2_VERSION", oVersions.osH2.c_str());
+    if (!oVersions.osH2GIS.empty())
+        SetMetadataItem("H2GIS_VERSION", oVersions.osH2GIS.c_str());
+    if (!oVersions.osJTS.empty())
+        SetMetadataItem("JTS_VERSION", oVersions.osJTS.c_str());
 }
 
 bool OGRH2GISDataSource::FetchTables(const char *pszSchemaPattern, const char *pszTablePattern, bool bSpatialOnly,

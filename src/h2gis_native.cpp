@@ -128,6 +128,20 @@ template <typename T> bool Bind(const char *pszLibrary, const char *pszName, T &
 }
 
 /**
+ * @brief Binds a function that older libraries do not have: left null
+ *        without error when it is missing.
+ * @return Always true.
+ */
+template <typename T> bool BindOptional(const char *pszLibrary, const char *pszName, T &pfn)
+{
+    CPLPushErrorHandler(CPLQuietErrorHandler);
+    pfn = reinterpret_cast<T>(CPLGetSymbol(pszLibrary, pszName));
+    CPLPopErrorHandler();
+    CPLErrorReset();
+    return true;
+}
+
+/**
  * @brief Binds all required C API symbols from the loaded library.
  *
  * @param osLibrary Path of the native library.
@@ -159,7 +173,8 @@ bool Load(const std::string &osLibrary)
            Bind(pszLib, "h2gis_bind_blob", g_sApi.bind_blob) &&
            Bind(pszLib, "h2gis_bind_null", g_sApi.bind_null) &&
            Bind(pszLib, "h2gis_execute_prepared", g_sApi.execute_prepared) &&
-           Bind(pszLib, "h2gis_execute_prepared_update", g_sApi.execute_prepared_update);
+           Bind(pszLib, "h2gis_execute_prepared_update", g_sApi.execute_prepared_update) &&
+           BindOptional(pszLib, "h2gis_get_versions", g_sApi.get_versions);
 }
 
 /**
@@ -230,6 +245,8 @@ void Initialize()
     tl_oThread.bOwned = false;
     g_bReady = true;
     CPLDebug("H2GIS", "Native library %s, C API version %d", osLibrary.c_str(), nVersion);
+    if (g_sApi.get_versions != nullptr)
+        CPLDebug("H2GIS", "Versions %s", TakeString(g_sApi.get_versions(pThread)).c_str());
 }
 
 }  // namespace

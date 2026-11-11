@@ -60,16 +60,18 @@ jobs:
 
   # One Linux binary per GDAL version, for every distribution that has this
   # GDAL version. It is compiled against the GDAL headers of conda-forge, with
-  # the system compiler of an old distribution (Ubuntu 22.04): the binary then
-  # only needs an old glibc and libstdc++, and it links to libgdal.so.<N>,
-  # whose name is set by GDAL itself, the same in all distributions and in
-  # conda-forge. No RPATH: the plugin uses the libgdal of the process that
-  # loads it.
+  # the system compiler of an old distribution (g++ 11 of Ubuntu 22.04): the
+  # binary then only needs an old glibc and libstdc++, and it links to
+  # libgdal.so.<N>, whose name is set by GDAL itself, the same in all
+  # distributions and in conda-forge. No RPATH: the plugin uses the libgdal of
+  # the process that loads it.
+  # It runs on the Ubuntu 22.04 runner itself, not in a container: the runner
+  # already has the compiler and the tools, so nothing is installed with
+  # apt-get (the DNS of the containers fails on some GitHub runners).
   linux:
     name: Linux GDAL ${{ matrix.gdal }}
     needs: config
-    runs-on: ubuntu-latest
-    container: ubuntu:22.04
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
@@ -78,12 +80,12 @@ jobs:
       run:
         shell: bash -el {0}
     steps:
-      - name: Install the system compiler
-        env:
-          DEBIAN_FRONTEND: noninteractive
+      - name: System compiler
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends build-essential curl ca-certificates bzip2 binutils zip
+          # g++ 11, the compiler of Ubuntu 22.04 (the runner has other ones)
+          echo "CC=gcc-11" >> "$GITHUB_ENV"
+          echo "CXX=g++-11" >> "$GITHUB_ENV"
+          g++-11 --version | head -1
       - uses: actions/checkout@v4
       # conda-forge has libgdal-core since GDAL 3.9, libgdal before
       - name: GDAL package
@@ -114,6 +116,12 @@ jobs:
             echo "The plugin must not have an RPATH"; exit 1
           fi
           echo "glibc required: $(objdump -T build/ogr_H2GIS.so | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+          # libstdc++ of Ubuntu 22.04: GLIBCXX_3.4.30 at most
+          glibcxx=$(objdump -T build/ogr_H2GIS.so | grep -o 'GLIBCXX_[0-9.]*' | sort -Vu | tail -1)
+          echo "libstdc++ required: $glibcxx"
+          if [ "$(printf '%s\n' "$glibcxx" GLIBCXX_3.4.30 | sort -V | tail -1)" != GLIBCXX_3.4.30 ]; then
+            echo "The plugin needs a libstdc++ newer than the one of Ubuntu 22.04"; exit 1
+          fi
       - name: Download the H2GIS native library
         run: bash .github/scripts/download-h2gis.sh h2gis-linux-x86_64.so build/h2gis.so
       - name: Test
@@ -155,8 +163,17 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends gdal-bin unzip
+          # The DNS of the container sometimes fails for a moment on the
+          # GitHub runners (apt-get update then only warns): retry
+          for attempt in 1 2 3 4 5; do
+            if apt-get update -o Acquire::Retries=3 &&
+               apt-get install -y --no-install-recommends gdal-bin unzip; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then exit 1; fi
+            echo "apt-get failed (attempt $attempt), retrying in 20 s"
+            sleep 20
+          done
       - name: Install GDAL (Fedora)
         if: matrix.family == 'fedora'
         run: dnf install -y gdal unzip

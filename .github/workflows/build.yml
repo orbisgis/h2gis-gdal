@@ -29,14 +29,31 @@ on:
         description: "Publish it as a pre-release"
         type: boolean
         default: false
+      h2gis:
+        description: "H2GIS native library: latest = the last release of H2GIS, graalvm-snapshot = the build of master"
+        type: choice
+        # GitHub cannot fill this list from the releases of H2GIS: add the
+        # new versions here, or give one in the field below.
+        options:
+          - latest
+          - graalvm-snapshot
+          - v2.2.6
+        default: latest
+      h2gis_other:
+        description: "Another H2GIS version (e.g. v2.2.7), used instead of the list above if given"
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
-env:
-  # The H2GIS native libraries, published by the CI of H2GIS: the snapshot of
-  # master, or the release of a version (.../releases/download/v2.2.6).
-  H2GIS_NATIVE_URL: https://github.com/orbisgis/H2GIS/releases/download/graalvm-snapshot
+# The H2GIS native libraries are published by the CI of H2GIS, on its GitHub
+# releases: graalvm-snapshot (the build of master) or the release of a version
+# (v2.2.6...). The config job chooses the release (H2GIS_NATIVE_URL of the
+# jobs):
+# - manual run: the H2GIS version chosen in the form (latest by default);
+# - tag v* pushed: the last release of H2GIS;
+# - push on main, pull request: graalvm-snapshot.
 
 jobs:
   config:
@@ -45,7 +62,33 @@ jobs:
     outputs:
       gdal: ${{ steps.versions.outputs.gdal }}
       linux: ${{ steps.versions.outputs.linux }}
+      h2gis: ${{ steps.h2gis.outputs.release }}
+      h2gis_url: ${{ steps.h2gis.outputs.url }}
     steps:
+      - id: h2gis
+        name: H2GIS native library
+        env:
+          GH_TOKEN: ${{ github.token }}
+          H2GIS_REPO: orbisgis/h2gis
+          CHOSEN: ${{ github.event_name == 'workflow_dispatch' && (inputs.h2gis_other || inputs.h2gis) || (startsWith(github.ref, 'refs/tags/v') && 'latest' || 'graalvm-snapshot') }}
+        run: |
+          release="$(echo "$CHOSEN" | tr -d '[:space:]')"
+          if [ "$release" = "latest" ]; then
+            # The last release of H2GIS (graalvm-snapshot is a pre-release: excluded)
+            release=$(gh release view -R "$H2GIS_REPO" --json tagName -q .tagName)
+          elif [[ "$release" =~ ^[0-9] ]]; then
+            release="v$release"
+          fi
+          if ! gh release view "$release" -R "$H2GIS_REPO" --json assets -q '.assets[].name' \
+              | grep -x 'h2gis-linux-x86_64.so' > /dev/null; then
+            echo "::error::The H2GIS release $release has no native libraries: run the workflow \"CI GraalVM\" of H2GIS on the tag $release (Actions > CI GraalVM > Run workflow, Use workflow from: $release), or choose another version."
+            exit 1
+          fi
+          url="https://github.com/$H2GIS_REPO/releases/download/$release"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "::notice::H2GIS native library: $release ($url)"
+          echo "H2GIS native library: **$release**" >> "$GITHUB_STEP_SUMMARY"
       # gdal: the GDAL versions to build for on all platforms (major.minor),
       # the one of the QGIS LTR and the latest stable one. Update them when
       # GDAL or the QGIS LTR moves to a new minor version (Help > About in
@@ -72,6 +115,8 @@ jobs:
     name: Linux GDAL ${{ matrix.gdal }}
     needs: config
     runs-on: ubuntu-22.04
+    env:
+      H2GIS_NATIVE_URL: ${{ needs.config.outputs.h2gis_url }}
     strategy:
       fail-fast: false
       matrix:
@@ -201,7 +246,10 @@ jobs:
   # is not the same DLL (gdal.dll against gdal3XX.dll) and cannot be used.
   windows-osgeo4w:
     name: Windows OSGeo4W
+    needs: config
     runs-on: windows-latest
+    env:
+      H2GIS_NATIVE_URL: ${{ needs.config.outputs.h2gis_url }}
     steps:
       - uses: actions/checkout@v4
       - name: Install GDAL from OSGeo4W
@@ -259,6 +307,8 @@ jobs:
     name: conda-forge ${{ matrix.os }} GDAL ${{ matrix.gdal }}
     needs: config
     runs-on: ${{ matrix.os }}
+    env:
+      H2GIS_NATIVE_URL: ${{ needs.config.outputs.h2gis_url }}
     strategy:
       fail-fast: false
       matrix:
@@ -316,11 +366,13 @@ jobs:
   release:
     name: GitHub release
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release != '')
-    needs: [linux, linux-distributions, windows-osgeo4w, conda]
+    needs: [config, linux, linux-distributions, windows-osgeo4w, conda]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
+      H2GIS_RELEASE: ${{ needs.config.outputs.h2gis }}
+      H2GIS_NATIVE_URL: ${{ needs.config.outputs.h2gis_url }}
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release || github.ref_name }}
@@ -355,14 +407,19 @@ jobs:
           cat SHA256SUMS
       - name: Create or update the release
         run: |
+          h2gis_line="H2GIS native library: [$H2GIS_RELEASE](https://github.com/orbisgis/h2gis/releases/tag/$H2GIS_RELEASE)"
           if gh release view "$TAG" > /dev/null 2>&1; then
             echo "Release $TAG exists: its files are replaced"
             gh release upload "$TAG" dist/* --clobber
+            # Update the H2GIS line of the notes (or add it)
+            notes=$(gh release view "$TAG" --json body -q .body | grep -v '^H2GIS native library: ' || true)
+            gh release edit "$TAG" --notes "$(printf '%s\n\n%s' "$h2gis_line" "$notes")"
           else
             options=()
             if [ "$PRERELEASE" = "true" ]; then options+=(--prerelease); fi
             # --target: the tag is created on the commit built (manual run)
+            # --notes is put before the generated notes
             gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "$TAG" \
-              --generate-notes "${options[@]}"
+              --notes "$h2gis_line" --generate-notes "${options[@]}"
           fi
           echo "::notice::Release $TAG: https://github.com/$GH_REPO/releases/tag/$TAG"
